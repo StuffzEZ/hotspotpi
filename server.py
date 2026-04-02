@@ -1,133 +1,229 @@
 #!/usr/bin/env python3
 """
-RPi → iPad USB Dashboard v2
-- FFmpeg H.264/WebM stream (15-30fps)
-- WebSocket audio (Opus/PCM via FFmpeg)
-- Bidirectional file manager (browse, download, upload)
-- Apple Pencil / touch → xdotool input injection
+RPi Link v4 — WiFi Hotspot Remote Desktop
+- Hidden WiFi hotspot via USB adapter (hostapd)
+- MJPEG screen streaming
+- Full mouse / touch / Apple Pencil input injection
+- Keyboard input + clipboard sync
+- Bidirectional file manager
+- Terminal (limited commands)
+- System stats + process manager
+- System controls (reboot/shutdown/sleep)
+- Screen recording (ffmpeg → file)
+- Notification injection
 """
 
-import os, io, time, json, subprocess, threading, base64, glob, shutil, mimetypes
-import asyncio, struct, wave
+import os, io, time, json, subprocess, threading, base64, glob, shutil, mimetypes, signal
+import asyncio
 from pathlib import Path
 from flask import (Flask, Response, jsonify, send_from_directory,
-                   request, stream_with_context, abort)
+                   request, stream_with_context, abort, send_file)
 from flask_sock import Sock
 import simple_websocket
 
 app  = Flask(__name__, static_folder='static')
 sock = Sock(app)
 
-DISPLAY   = os.environ.get("DISPLAY", ":0")
-AUDIO_DEV = os.environ.get("AUDIO_DEV", "default")   # ALSA device
+# ── Load config ────────────────────────────────────────────
+CONFIG_PATH = Path(__file__).parent / 'config.json'
+try:
+    with open(CONFIG_PATH) as f:
+        CONFIG = json.load(f)
+except Exception:
+    CONFIG = {
+        "hotspot_iface": "wlan1",
+        "hotspot_ip":    "10.42.0.1",
+        "hotspot_ssid":  "RPiLink",
+        "server_port":   80
+    }
+
+DISPLAY    = os.environ.get("DISPLAY", ":0")
+AUDIO_DEV  = os.environ.get("AUDIO_DEV", "default")
 UPLOAD_DIR = Path("/tmp/rpi-uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
+RECORDINGS_DIR = Path("/tmp/rpi-recordings")
+RECORDINGS_DIR.mkdir(exist_ok=True)
 
-# ── HELPERS ───────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────
 
-def run(cmd, shell=True, timeout=5):
+def run(cmd, shell=True, timeout=8):
     try:
-        return subprocess.check_output(cmd, shell=shell,
-               stderr=subprocess.DEVNULL, timeout=timeout).decode().strip()
+        return subprocess.check_output(
+            cmd, shell=shell, stderr=subprocess.DEVNULL, timeout=timeout
+        ).decode().strip()
     except Exception:
         return ""
 
 def get_display_res():
-    """Get current display resolution."""
     raw = run(f"DISPLAY={DISPLAY} xdpyinfo 2>/dev/null | grep dimensions | awk '{{print $2}}'")
     if raw and 'x' in raw:
         w, h = raw.split('x')
         return int(w), int(h)
     return 1920, 1080
 
-# ── SYSTEM STATS ──────────────────────────────────────────
+# ── System stats ───────────────────────────────────────────
 
 def cpu_temp():
-    # vcgencmd works on all Pi models
     raw = run("vcgencmd measure_temp 2>/dev/null")
     if "temp=" in raw:
         return raw.replace("temp=","").replace("'C","")
-    # Pi 5 fallback: thermal_zone0 is the SoC temp
     for zone in ["/sys/class/thermal/thermal_zone0/temp",
                  "/sys/class/thermal/thermal_zone1/temp"]:
         try:
-            val = open(zone).read().strip()
-            return str(round(int(val)/1000, 1))
+            return str(round(int(open(zone).read().strip()) / 1000, 1))
         except Exception:
             continue
     return "N/A"
 
 def pi_model():
     try:
-        return open("/proc/device-tree/model","r").read().replace('\x00','').strip()
+        return open("/proc/device-tree/model").read().replace('\x00','').strip()
     except Exception:
-        return run("cat /proc/device-tree/model 2>/dev/null || echo Unknown")
+        return "Raspberry Pi"
 
 def cpu_percent():
     return run("top -bn1 | grep 'Cpu(s)' | awk '{print $2+$4}'") or "0"
 
 def mem_info():
     raw = run("free -m | awk 'NR==2{print $2,$3,$4}'").split()
-    if len(raw)==3:
-        total,used,free=raw
-        return {"total":total,"used":used,"free":free,"pct":round(int(used)/int(total)*100,1)}
+    if len(raw) == 3:
+        total, used, free = raw
+        return {"total": total, "used": used, "free": free,
+                "pct": round(int(used) / int(total) * 100, 1)}
     return {"total":"?","used":"?","free":"?","pct":0}
 
 def disk_info():
     raw = run("df -h / | awk 'NR==2{print $2,$3,$4,$5}'").split()
-    if len(raw)==4:
-        return {"total":raw[0],"used":raw[1],"free":raw[2],"pct":raw[3]}
+    if len(raw) == 4:
+        return {"total": raw[0], "used": raw[1], "free": raw[2], "pct": raw[3]}
     return {"total":"?","used":"?","free":"?","pct":"?"}
 
 def processes():
-    raw = run("ps aux --sort=-%cpu | head -8 | tail -7")
-    procs=[]
+    raw = run("ps aux --sort=-%cpu | head -12 | tail -11")
+    procs = []
     for line in raw.splitlines():
-        parts=line.split(None,10)
-        if len(parts)>=11:
-            procs.append({"user":parts[0],"cpu":parts[2],"mem":parts[3],"cmd":parts[10][:40]})
+        parts = line.split(None, 10)
+        if len(parts) >= 11:
+            procs.append({
+                "pid":  parts[1],
+                "user": parts[0],
+                "cpu":  parts[2],
+                "mem":  parts[3],
+                "cmd":  parts[10][:50]
+            })
     return procs
 
 def net_stats():
-    r = run("cat /proc/net/dev | grep usb0")
+    iface = CONFIG.get("hotspot_iface", "wlan1")
+    r = run(f"cat /proc/net/dev | grep {iface}")
     if r:
-        p=r.split()
-        try: return {"rx":p[1],"tx":p[9]}
-        except: pass
-    return {"rx":"0","tx":"0"}
+        p = r.split()
+        try:
+            return {"rx": p[1], "tx": p[9], "iface": iface}
+        except:
+            pass
+    return {"rx":"0","tx":"0","iface": iface}
 
-# ── VIDEO STREAMING ───────────────────────────────────────
-#
-# Strategy:
-#   1. FFmpeg captures X11 screen → pipe raw JPEG frames
-#   2. Flask MJPEG route wraps them → Safari renders natively
-#   Quality knobs: -r (fps), -vf scale, -q:v (jpeg quality 2-31, lower=better)
+def hotspot_clients():
+    """Return list of connected clients via ARP or dnsmasq leases."""
+    clients = []
+    # dnsmasq leases file
+    for lease_file in ["/var/lib/misc/dnsmasq.leases", "/tmp/dnsmasq.leases"]:
+        if os.path.exists(lease_file):
+            for line in open(lease_file).readlines():
+                parts = line.strip().split()
+                if len(parts) >= 4:
+                    clients.append({"mac": parts[1], "ip": parts[2], "name": parts[3]})
+            if clients:
+                return clients
+    # Fallback: ARP table
+    arp = run("arp -n 2>/dev/null | grep -v incomplete | tail -10")
+    for line in arp.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and '.' in parts[0]:
+            clients.append({"ip": parts[0], "mac": parts[2], "name": "?"})
+    return clients
 
-_ffmpeg_proc = None
-_frame_lock   = threading.Lock()
+# ── Clipboard ──────────────────────────────────────────────
+
+def get_clipboard():
+    for tool in ["xclip -selection clipboard -o", "xsel --clipboard --output"]:
+        result = run(f"DISPLAY={DISPLAY} {tool}")
+        if result is not None:
+            return result
+    return ""
+
+def set_clipboard(text):
+    env = f"DISPLAY={DISPLAY}"
+    for cmd in [f"echo '{text}' | DISPLAY={DISPLAY} xclip -selection clipboard",
+                f"echo '{text}' | DISPLAY={DISPLAY} xsel --clipboard --input"]:
+        try:
+            subprocess.run(cmd, shell=True, timeout=3)
+            return True
+        except:
+            continue
+    return False
+
+# ── Screen recording ───────────────────────────────────────
+_recording_proc = None
+_recording_file = None
+
+def start_recording():
+    global _recording_proc, _recording_file
+    if _recording_proc and _recording_proc.poll() is None:
+        return {"ok": False, "error": "Already recording"}
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    _recording_file = str(RECORDINGS_DIR / f"recording_{ts}.mp4")
+    w, h = get_display_res()
+    cmd = [
+        "ffmpeg", "-loglevel", "quiet",
+        "-f", "x11grab", "-framerate", "15",
+        "-video_size", f"{w}x{h}",
+        "-i", f"{DISPLAY}.0+0,0",
+        "-c:v", "libx264", "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p",
+        _recording_file
+    ]
+    _recording_proc = subprocess.Popen(cmd)
+    return {"ok": True, "file": _recording_file}
+
+def stop_recording():
+    global _recording_proc, _recording_file
+    if not _recording_proc or _recording_proc.poll() is not None:
+        return {"ok": False, "error": "Not recording"}
+    _recording_proc.send_signal(signal.SIGINT)
+    _recording_proc.wait(timeout=10)
+    f = _recording_file
+    _recording_proc = None
+    _recording_file = None
+    return {"ok": True, "file": f}
+
+# ── Video streaming ────────────────────────────────────────
+_ffmpeg_proc  = None
 _latest_frame = None
+_frame_lock   = threading.Lock()
 _frame_cond   = threading.Condition(_frame_lock)
 
-def ffmpeg_capture_loop(fps=24, width=1280, scale_height=-1, quality=4):
+def ffmpeg_capture_loop(fps=24, width=1280, quality=4):
     global _ffmpeg_proc, _latest_frame
+    disp_w, disp_h = get_display_res()
+    scale_h = int(disp_h * width / disp_w)
     cmd = [
         "ffmpeg", "-loglevel", "quiet",
         "-f", "x11grab",
         "-framerate", str(fps),
-        "-video_size", f"{width}x{get_display_res()[1] if scale_height==-1 else scale_height}",
+        "-video_size", f"{disp_w}x{disp_h}",
         "-i", f"{DISPLAY}.0+0,0",
-        "-vf", f"scale={width}:{scale_height}:flags=lanczos",
+        "-vf", f"scale={width}:{scale_h}:flags=lanczos",
         "-f", "image2pipe",
         "-vcodec", "mjpeg",
         "-q:v", str(quality),
         "pipe:1"
     ]
     _ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-
     buf = b""
     SOI = b"\xff\xd8"
     EOI = b"\xff\xd9"
-
     while True:
         chunk = _ffmpeg_proc.stdout.read(65536)
         if not chunk:
@@ -138,22 +234,16 @@ def ffmpeg_capture_loop(fps=24, width=1280, scale_height=-1, quality=4):
             if start == -1:
                 buf = b""
                 break
-            end = buf.find(EOI, start+2)
+            end = buf.find(EOI, start + 2)
             if end == -1:
                 buf = buf[start:]
                 break
-            frame = buf[start:end+2]
-            buf   = buf[end+2:]
+            frame = buf[start:end + 2]
+            buf   = buf[end + 2:]
             with _frame_cond:
                 _latest_frame = frame
                 _frame_cond.notify_all()
 
-def get_frame(timeout=1.0):
-    with _frame_cond:
-        _frame_cond.wait(timeout)
-        return _latest_frame
-
-# Start capture thread
 _capture_settings = {"fps": 24, "width": 1280, "quality": 4}
 
 def restart_capture(**kwargs):
@@ -162,40 +252,33 @@ def restart_capture(**kwargs):
     if _ffmpeg_proc:
         _ffmpeg_proc.terminate()
         _ffmpeg_proc = None
-    t = threading.Thread(
-        target=ffmpeg_capture_loop,
-        kwargs=_capture_settings,
-        daemon=True
-    )
+    t = threading.Thread(target=ffmpeg_capture_loop, kwargs=_capture_settings, daemon=True)
     t.start()
 
 restart_capture()
 
-# ── AUDIO STREAMING ───────────────────────────────────────
-#
-# FFmpeg captures PulseAudio/ALSA → raw s16le PCM → WebSocket
-# Browser Web Audio API plays it in real time.
-# Rate: 44100Hz, stereo, 16-bit → ~176KB/s — fine over USB.
+def get_frame(timeout=1.0):
+    with _frame_cond:
+        _frame_cond.wait(timeout)
+        return _latest_frame
 
+# ── Audio streaming ────────────────────────────────────────
 _audio_clients = set()
 _audio_lock    = threading.Lock()
 
 def audio_broadcast_loop():
     cmd = [
         "ffmpeg", "-loglevel", "quiet",
-        "-f", "pulse", "-i", "default",   # PulseAudio
+        "-f", "pulse", "-i", "default",
         "-ac", "2", "-ar", "44100",
-        "-f", "s16le",
-        "pipe:1"
+        "-f", "s16le", "pipe:1"
     ]
-    # fallback to alsa
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     if proc.poll() is not None:
         cmd[3] = "alsa"
         cmd[5] = AUDIO_DEV
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-
-    CHUNK = 4096  # ~23ms at 44100Hz stereo s16le
+    CHUNK = 4096
     while True:
         data = proc.stdout.read(CHUNK)
         if not data:
@@ -211,53 +294,39 @@ def audio_broadcast_loop():
 
 threading.Thread(target=audio_broadcast_loop, daemon=True).start()
 
-# ── INPUT INJECTION ───────────────────────────────────────
+# ── Input injection ────────────────────────────────────────
 
-def inject_mouse(action, x, y, button=1, dx=0, dy=0, stream_w=1280):
-    """Translate stream coords → display coords and inject via xdotool."""
+def inject_mouse(action, x, y, button=1, dy=0, stream_w=1280):
     disp_w, disp_h = get_display_res()
-    # scale from stream width maintaining aspect ratio
     stream_h = int(disp_h * stream_w / disp_w)
-    rx = int(x * disp_w / stream_w)
-    ry = int(y * disp_h / stream_h)
-    rx = max(0, min(rx, disp_w-1))
-    ry = max(0, min(ry, disp_h-1))
-
+    rx = max(0, min(int(x * disp_w / stream_w), disp_w - 1))
+    ry = max(0, min(int(y * disp_h / stream_h), disp_h - 1))
     env = {"DISPLAY": DISPLAY}
     base = ["xdotool"]
-
     if action == "move":
-        subprocess.Popen(base + ["mousemove", str(rx), str(ry)],
-                         env=env, stderr=subprocess.DEVNULL)
+        subprocess.Popen(base + ["mousemove", str(rx), str(ry)], env=env, stderr=subprocess.DEVNULL)
     elif action == "down":
-        subprocess.Popen(base + ["mousemove", str(rx), str(ry),
-                                  "mousedown", str(button)],
-                         env=env, stderr=subprocess.DEVNULL)
+        subprocess.Popen(base + ["mousemove", str(rx), str(ry), "mousedown", str(button)], env=env, stderr=subprocess.DEVNULL)
     elif action == "up":
-        subprocess.Popen(base + ["mousemove", str(rx), str(ry),
-                                  "mouseup", str(button)],
-                         env=env, stderr=subprocess.DEVNULL)
+        subprocess.Popen(base + ["mousemove", str(rx), str(ry), "mouseup", str(button)], env=env, stderr=subprocess.DEVNULL)
     elif action == "click":
-        subprocess.Popen(base + ["mousemove", str(rx), str(ry),
-                                  "click", str(button)],
-                         env=env, stderr=subprocess.DEVNULL)
+        subprocess.Popen(base + ["mousemove", str(rx), str(ry), "click", str(button)], env=env, stderr=subprocess.DEVNULL)
+    elif action == "dblclick":
+        subprocess.Popen(base + ["mousemove", str(rx), str(ry), "click", "--repeat", "2", "--delay", "50", str(button)], env=env, stderr=subprocess.DEVNULL)
     elif action == "scroll":
-        btn = "4" if dy < 0 else "5"  # scroll up=4 down=5
-        subprocess.Popen(base + ["mousemove", str(rx), str(ry),
-                                  "click", "--repeat", "3", btn],
-                         env=env, stderr=subprocess.DEVNULL)
+        btn = "4" if dy < 0 else "5"
+        subprocess.Popen(base + ["mousemove", str(rx), str(ry), "click", "--repeat", "3", btn], env=env, stderr=subprocess.DEVNULL)
+    elif action == "rclick":
+        subprocess.Popen(base + ["mousemove", str(rx), str(ry), "click", "3"], env=env, stderr=subprocess.DEVNULL)
 
 def inject_key(key):
-    env = {"DISPLAY": DISPLAY}
-    subprocess.Popen(["xdotool", "key", key],
-                     env=env, stderr=subprocess.DEVNULL)
+    subprocess.Popen(["xdotool", "key", "--", key], env={"DISPLAY": DISPLAY}, stderr=subprocess.DEVNULL)
 
 def inject_type(text):
-    env = {"DISPLAY": DISPLAY}
     subprocess.Popen(["xdotool", "type", "--clearmodifiers", "--", text],
-                     env=env, stderr=subprocess.DEVNULL)
+                     env={"DISPLAY": DISPLAY}, stderr=subprocess.DEVNULL)
 
-# ── ROUTES: VIDEO ──────────────────────────────────────────
+# ── Routes: Video ──────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -285,8 +354,7 @@ def stream():
 
     return Response(stream_with_context(generate()),
                     mimetype="multipart/x-mixed-replace; boundary=frame",
-                    headers={"Cache-Control": "no-store",
-                             "X-Accel-Buffering": "no"})
+                    headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
 @app.route("/api/screenshot")
 def screenshot():
@@ -294,18 +362,18 @@ def screenshot():
     if not frame:
         return Response("no frame", status=503)
     return Response(frame, mimetype="image/jpeg",
-                    headers={"Cache-Control":"no-store"})
+                    headers={"Cache-Control": "no-store"})
 
 @app.route("/api/stream/settings", methods=["POST"])
 def stream_settings():
-    body = request.get_json(silent=True) or {}
-    fps  = int(body.get("fps", 24))
-    qual = int(body.get("quality", 4))   # 2=best, 10=balanced, 31=lowest
-    w    = int(body.get("width", 1280))
+    body  = request.get_json(silent=True) or {}
+    fps   = int(body.get("fps",  24))
+    qual  = int(body.get("quality", 4))
+    w     = int(body.get("width", 1280))
     restart_capture(fps=fps, quality=qual, width=w)
-    return jsonify({"ok": True, "fps": fps, "quality": qual, "width": w})
+    return jsonify({"ok": True})
 
-# ── ROUTES: AUDIO ──────────────────────────────────────────
+# ── Routes: Audio ──────────────────────────────────────────
 
 @sock.route("/ws/audio")
 def audio_ws(ws):
@@ -313,26 +381,25 @@ def audio_ws(ws):
         _audio_clients.add(ws)
     try:
         while True:
-            ws.receive(timeout=60)  # keep alive
+            ws.receive(timeout=60)
     except Exception:
         pass
     finally:
         with _audio_lock:
             _audio_clients.discard(ws)
 
-# ── ROUTES: INPUT ──────────────────────────────────────────
+# ── Routes: Input ──────────────────────────────────────────
 
 @app.route("/api/input/mouse", methods=["POST"])
 def input_mouse():
     body   = request.get_json(silent=True) or {}
-    action = body.get("action", "move")   # move|down|up|click|scroll
+    action = body.get("action", "move")
     x      = float(body.get("x", 0))
     y      = float(body.get("y", 0))
     btn    = int(body.get("button", 1))
-    dx     = float(body.get("dx", 0))
     dy     = float(body.get("dy", 0))
     sw     = int(body.get("streamW", 1280))
-    inject_mouse(action, x, y, btn, dx, dy, sw)
+    inject_mouse(action, x, y, btn, dy, sw)
     return jsonify({"ok": True})
 
 @app.route("/api/input/key", methods=["POST"])
@@ -351,17 +418,30 @@ def input_type():
         inject_type(text)
     return jsonify({"ok": True})
 
-# ── ROUTES: FILES ──────────────────────────────────────────
+# ── Routes: Clipboard ──────────────────────────────────────
+
+@app.route("/api/clipboard", methods=["GET"])
+def clipboard_get():
+    return jsonify({"text": get_clipboard()})
+
+@app.route("/api/clipboard", methods=["POST"])
+def clipboard_set():
+    body = request.get_json(silent=True) or {}
+    text = body.get("text", "")
+    ok   = set_clipboard(text)
+    return jsonify({"ok": ok})
+
+# ── Routes: Files ──────────────────────────────────────────
 
 ALLOWED_BROWSE_ROOTS = [
     Path.home(),
     Path("/tmp"),
     Path("/media"),
     Path("/mnt"),
+    RECORDINGS_DIR,
 ]
 
 def safe_path(raw):
-    """Resolve and validate path stays within allowed roots."""
     p = Path(raw).resolve()
     for root in ALLOWED_BROWSE_ROOTS:
         try:
@@ -377,7 +457,6 @@ def files_list():
     path = safe_path(raw)
     if not path or not path.exists():
         return jsonify({"error": "Invalid path"}), 400
-
     entries = []
     try:
         for item in sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name.lower())):
@@ -392,12 +471,7 @@ def files_list():
             })
     except PermissionError:
         return jsonify({"error": "Permission denied"}), 403
-
-    return jsonify({
-        "path":    str(path),
-        "parent":  str(path.parent),
-        "entries": entries,
-    })
+    return jsonify({"path": str(path), "parent": str(path.parent), "entries": entries})
 
 @app.route("/api/files/download")
 def files_download():
@@ -413,10 +487,9 @@ def files_upload():
     dest     = safe_path(dest_raw)
     if not dest or not dest.is_dir():
         return jsonify({"error": "Invalid destination"}), 400
-
     saved = []
     for f in request.files.values():
-        name = Path(f.filename).name  # strip path
+        name = Path(f.filename).name
         out  = dest / name
         f.save(str(out))
         saved.append(name)
@@ -425,76 +498,134 @@ def files_upload():
 @app.route("/api/files/mkdir", methods=["POST"])
 def files_mkdir():
     body = request.get_json(silent=True) or {}
-    dest = safe_path(body.get("path",""))
+    dest = safe_path(body.get("path", ""))
     if not dest:
-        return jsonify({"error":"Invalid path"}),400
+        return jsonify({"error": "Invalid path"}), 400
     dest.mkdir(parents=True, exist_ok=True)
-    return jsonify({"ok":True})
+    return jsonify({"ok": True})
 
 @app.route("/api/files/delete", methods=["POST"])
 def files_delete():
     body = request.get_json(silent=True) or {}
-    path = safe_path(body.get("path",""))
+    path = safe_path(body.get("path", ""))
     if not path or not path.exists():
-        return jsonify({"error":"Not found"}),404
+        return jsonify({"error": "Not found"}), 404
     if path.is_dir():
         shutil.rmtree(str(path))
     else:
         path.unlink()
-    return jsonify({"ok":True})
+    return jsonify({"ok": True})
 
 @app.route("/api/files/rename", methods=["POST"])
 def files_rename():
-    body = request.get_json(silent=True) or {}
-    src  = safe_path(body.get("src",""))
-    new_name = Path(body.get("name","")).name
+    body     = request.get_json(silent=True) or {}
+    src      = safe_path(body.get("src", ""))
+    new_name = Path(body.get("name", "")).name
     if not src or not src.exists() or not new_name:
-        return jsonify({"error":"Invalid"}),400
+        return jsonify({"error": "Invalid"}), 400
     dst = src.parent / new_name
     src.rename(dst)
-    return jsonify({"ok":True})
+    return jsonify({"ok": True})
 
-# ── ROUTES: STATS & TERMINAL ───────────────────────────────
+# ── Routes: Recording ──────────────────────────────────────
+
+@app.route("/api/record/start", methods=["POST"])
+def record_start():
+    return jsonify(start_recording())
+
+@app.route("/api/record/stop", methods=["POST"])
+def record_stop():
+    return jsonify(stop_recording())
+
+@app.route("/api/record/status")
+def record_status():
+    recording = _recording_proc is not None and _recording_proc.poll() is None
+    return jsonify({"recording": recording, "file": _recording_file})
+
+# ── Routes: System ─────────────────────────────────────────
 
 @app.route("/api/stats")
 def stats():
     mem  = mem_info()
     disk = disk_info()
-    # Gadget status
-    udc_bound = bool(run("cat /sys/kernel/config/usb_gadget/rpi-link/UDC 2>/dev/null"))
+    iface = CONFIG.get("hotspot_iface", "wlan1")
+    hotspot_ip = run(f"ip addr show {iface} 2>/dev/null | grep 'inet ' | awk '{{print $2}}'") or "not up"
     return jsonify({
         "hostname":  run("hostname"),
         "model":     pi_model(),
-        "uptime":    run("uptime -p").replace("up ",""),
+        "uptime":    run("uptime -p").replace("up ", ""),
         "cpu":       cpu_percent(),
         "temp":      cpu_temp(),
         "mem":       mem,
         "disk":      disk,
-        "usb_ip":    run("ip addr show usb0 2>/dev/null | grep 'inet ' | awk '{print $2}'") or "not connected",
+        "hotspot_ip": hotspot_ip,
+        "hotspot_iface": iface,
         "net":       net_stats(),
         "processes": processes(),
+        "clients":   hotspot_clients(),
         "time":      time.strftime("%H:%M:%S"),
         "date":      time.strftime("%A %d %B %Y"),
         "display":   "%dx%d" % get_display_res(),
         "stream":    _capture_settings,
-        "gadget_ok": udc_bound,
+        "recording": _recording_proc is not None and _recording_proc.poll() is None,
     })
 
-BLOCKED = ["rm -rf","mkfs","dd ","shutdown","reboot","passwd","wget","curl","chmod 777"]
+@app.route("/api/process/kill", methods=["POST"])
+def process_kill():
+    body = request.get_json(silent=True) or {}
+    pid  = int(body.get("pid", 0))
+    sig  = body.get("signal", "TERM")
+    if not pid:
+        return jsonify({"error": "No PID"}), 400
+    try:
+        os.kill(pid, signal.SIGTERM if sig == "TERM" else signal.SIGKILL)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/system/reboot", methods=["POST"])
+def system_reboot():
+    threading.Timer(2.0, lambda: subprocess.run(["reboot"])).start()
+    return jsonify({"ok": True, "message": "Rebooting in 2s…"})
+
+@app.route("/api/system/shutdown", methods=["POST"])
+def system_shutdown():
+    threading.Timer(2.0, lambda: subprocess.run(["shutdown", "-h", "now"])).start()
+    return jsonify({"ok": True, "message": "Shutting down in 2s…"})
+
+@app.route("/api/system/sleep", methods=["POST"])
+def system_sleep():
+    subprocess.Popen(["systemctl", "suspend"])
+    return jsonify({"ok": True})
+
+BLOCKED = ["rm -rf /", "mkfs", "dd if=", "fork bomb", ":(){ :|:& };:"]
 
 @app.route("/api/run", methods=["POST"])
 def run_cmd():
     body = request.get_json(silent=True) or {}
-    cmd  = body.get("cmd","").strip()
+    cmd  = body.get("cmd", "").strip()
     if any(b in cmd for b in BLOCKED):
-        return jsonify({"error":"Command blocked"}),403
+        return jsonify({"error": "Command blocked"}), 403
     if not cmd:
-        return jsonify({"output":""})
-    out = run(cmd, timeout=10)
-    return jsonify({"output": out})
+        return jsonify({"output": ""})
+    out = run(cmd, timeout=15)
+    return jsonify({"output": out or "(no output)"})
 
-# ── MAIN ──────────────────────────────────────────────────
+# ── Routes: Hotspot info ───────────────────────────────────
+
+@app.route("/api/hotspot")
+def hotspot_info():
+    return jsonify({
+        "ssid":    CONFIG.get("hotspot_ssid", "RPiLink"),
+        "iface":   CONFIG.get("hotspot_iface", "wlan1"),
+        "ip":      CONFIG.get("hotspot_ip", "10.42.0.1"),
+        "clients": hotspot_clients(),
+        "hostapd_running": run("systemctl is-active hostapd") == "active",
+    })
+
+# ── Main ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("RPi Dashboard v2 → http://0.0.0.0:80")
-    app.run(host="0.0.0.0", port=80, debug=False, threaded=True)
+    port = CONFIG.get("server_port", 80)
+    print(f"RPi Link v4 → http://0.0.0.0:{port}")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
