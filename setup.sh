@@ -1,306 +1,631 @@
-#!/bin/bash
-# =============================================================
-# RPi Link v3 — Setup Script
-# Supports: Raspberry Pi 4 and Raspberry Pi 5
-# OS:       Raspberry Pi OS Bookworm
-# Run:      sudo bash setup.sh
-# =============================================================
-set -e
+#!/usr/bin/env python3
+"""
+RPi Link v4 — WiFi Hotspot Remote Desktop
+- Hidden WiFi hotspot via USB adapter (hostapd)
+- MJPEG screen streaming
+- Full mouse / touch / Apple Pencil input injection
+- Keyboard input + clipboard sync
+- Bidirectional file manager
+- Terminal (limited commands)
+- System stats + process manager
+- System controls (reboot/shutdown/sleep)
+- Screen recording (ffmpeg → file)
+- Notification injection
+"""
 
-RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'
-CYN='\033[0;36m'; BLD='\033[1m'; NC='\033[0m'
+import os, io, time, json, subprocess, threading, base64, glob, shutil, mimetypes, signal
+import asyncio
+from pathlib import Path
+from flask import (Flask, Response, jsonify, send_from_directory,
+                   request, stream_with_context, abort, send_file)
+from flask_sock import Sock
+import simple_websocket
 
-info()  { echo -e "  ${GRN}[✓]${NC} $1"; }
-warn()  { echo -e "  ${YLW}[!]${NC} $1"; }
-error() { echo -e "  ${RED}[✗]${NC} $1"; exit 1; }
-step()  { echo -e "\n${CYN}${BLD}── $1 ──${NC}"; }
+app  = Flask(__name__, static_folder='static')
+sock = Sock(app)
 
-[[ $EUID -ne 0 ]] && error "Run as root: sudo bash setup.sh"
+# ── Load config ────────────────────────────────────────────
+CONFIG_PATH = Path(__file__).parent / 'config.json'
+try:
+    with open(CONFIG_PATH) as f:
+        CONFIG = json.load(f)
+except Exception:
+    CONFIG = {
+        "hotspot_iface": "wlan1",
+        "hotspot_ip":    "10.42.0.1",
+        "hotspot_ssid":  "RPiLink",
+        "server_port":   80
+    }
 
-# ── Detect model and paths ─────────────────────────────────
-PIMODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")
-echo -e "\n${BLD}RPi Link v3 — Setup${NC}"
-echo -e "  Model:  ${CYN}${PIMODEL}${NC}"
+DISPLAY    = os.environ.get("DISPLAY", ":0")
+AUDIO_DEV  = os.environ.get("AUDIO_DEV", "default")
+UPLOAD_DIR = Path("/tmp/rpi-uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+RECORDINGS_DIR = Path("/tmp/rpi-recordings")
+RECORDINGS_DIR.mkdir(exist_ok=True)
 
-IS_PI5=false
-echo "$PIMODEL" | grep -q "Raspberry Pi 5" && IS_PI5=true
+# ── Helpers ────────────────────────────────────────────────
 
-# Bookworm uses /boot/firmware; legacy Bullseye uses /boot
-if [ -d /boot/firmware ] && [ -f /boot/firmware/config.txt ]; then
-    BOOT_DIR=/boot/firmware
-else
-    BOOT_DIR=/boot
-fi
-CONFIG_TXT="$BOOT_DIR/config.txt"
-CMDLINE_TXT="$BOOT_DIR/cmdline.txt"
-echo -e "  Boot:   ${CYN}${BOOT_DIR}${NC}\n"
+def run(cmd, shell=True, timeout=8):
+    try:
+        return subprocess.check_output(
+            cmd, shell=shell, stderr=subprocess.DEVNULL, timeout=timeout
+        ).decode().strip()
+    except Exception:
+        return ""
 
-# =============================================================
-# STEP 1 — Packages
-# =============================================================
-step "Installing packages"
+def get_display_res():
+    raw = run(f"DISPLAY={DISPLAY} xdpyinfo 2>/dev/null | grep dimensions | awk '{{print $2}}'")
+    if raw and 'x' in raw:
+        w, h = raw.split('x')
+        return int(w), int(h)
+    return 1920, 1080
 
-apt-get update -qq
-apt-get install -y \
-    python3 python3-pip \
-    ffmpeg \
-    xdotool x11-utils xvfb \
-    avahi-daemon \
-    dnsmasq \
-    pulseaudio pulseaudio-utils \
-    net-tools iproute2 \
-    network-manager
-info "System packages installed"
+# ── System stats ───────────────────────────────────────────
 
-# Install Python deps (Bookworm requires --break-system-packages)
-pip3 install --break-system-packages \
-    flask flask-sock simple-websocket pillow 2>/dev/null \
-|| pip3 install flask flask-sock simple-websocket pillow
-info "Python packages installed"
+def cpu_temp():
+    raw = run("vcgencmd measure_temp 2>/dev/null")
+    if "temp=" in raw:
+        return raw.replace("temp=","").replace("'C","")
+    for zone in ["/sys/class/thermal/thermal_zone0/temp",
+                 "/sys/class/thermal/thermal_zone1/temp"]:
+        try:
+            return str(round(int(open(zone).read().strip()) / 1000, 1))
+        except Exception:
+            continue
+    return "N/A"
 
-# =============================================================
-# STEP 2 — config.txt: enable dwc2 peripheral mode
-# =============================================================
-step "Configuring USB gadget overlay in config.txt"
+def pi_model():
+    try:
+        return open("/proc/device-tree/model").read().replace('\x00','').strip()
+    except Exception:
+        return "Raspberry Pi"
 
-# Remove ALL existing dwc2 lines we may have written before (clean slate)
-sed -i '/# RPi Link/d'                          "$CONFIG_TXT"
-sed -i '/dtoverlay=dwc2/d'                      "$CONFIG_TXT"
-sed -i '/otg_mode/d'                            "$CONFIG_TXT"
-# Also clean legacy cmdline approach
-sed -i 's/ modules-load=dwc2,g_ether//'         "$CMDLINE_TXT" 2>/dev/null || true
-sed -i 's/modules-load=dwc2,g_ether //'         "$CMDLINE_TXT" 2>/dev/null || true
+def cpu_percent():
+    return run("top -bn1 | grep 'Cpu(s)' | awk '{print $2+$4}'") or "0"
 
-# Pi 4 and Pi 5 both need dwc2 in peripheral mode.
-# On Pi 5, the USB-C port is a separate controller — we must
-# also ensure it is NOT in host-only mode.
-cat >> "$CONFIG_TXT" << 'EOF'
+def mem_info():
+    raw = run("free -m | awk 'NR==2{print $2,$3,$4}'").split()
+    if len(raw) == 3:
+        total, used, free = raw
+        return {"total": total, "used": used, "free": free,
+                "pct": round(int(used) / int(total) * 100, 1)}
+    return {"total":"?","used":"?","free":"?","pct":0}
 
-# RPi Link: USB gadget mode (libcomposite)
-dtoverlay=dwc2,dr_mode=peripheral
-EOF
+def disk_info():
+    raw = run("df -h / | awk 'NR==2{print $2,$3,$4,$5}'").split()
+    if len(raw) == 4:
+        return {"total": raw[0], "used": raw[1], "free": raw[2], "pct": raw[3]}
+    return {"total":"?","used":"?","free":"?","pct":"?"}
 
-info "dtoverlay=dwc2,dr_mode=peripheral written to $CONFIG_TXT"
+def processes():
+    raw = run("ps aux --sort=-%cpu | head -12 | tail -11")
+    procs = []
+    for line in raw.splitlines():
+        parts = line.split(None, 10)
+        if len(parts) >= 11:
+            procs.append({
+                "pid":  parts[1],
+                "user": parts[0],
+                "cpu":  parts[2],
+                "mem":  parts[3],
+                "cmd":  parts[10][:50]
+            })
+    return procs
 
-# Remove dwc2/g_ether from /etc/modules (old approach — not needed with libcomposite)
-sed -i '/^dwc2$/d'    /etc/modules
-sed -i '/^g_ether$/d' /etc/modules
-# Add libcomposite so it loads at boot before the gadget service runs
-grep -q "^libcomposite$" /etc/modules || echo "libcomposite" >> /etc/modules
-info "libcomposite added to /etc/modules"
+def net_stats():
+    iface = CONFIG.get("hotspot_iface", "wlan1")
+    r = run(f"cat /proc/net/dev | grep {iface}")
+    if r:
+        p = r.split()
+        try:
+            return {"rx": p[1], "tx": p[9], "iface": iface}
+        except:
+            pass
+    return {"rx":"0","tx":"0","iface": iface}
 
-# =============================================================
-# STEP 3 — Install gadget scripts
-# =============================================================
-step "Installing gadget scripts"
+def hotspot_clients():
+    """Return list of connected clients via ARP or dnsmasq leases."""
+    clients = []
+    # dnsmasq leases file
+    for lease_file in ["/var/lib/misc/dnsmasq.leases", "/tmp/dnsmasq.leases"]:
+        if os.path.exists(lease_file):
+            for line in open(lease_file).readlines():
+                parts = line.strip().split()
+                if len(parts) >= 4:
+                    clients.append({"mac": parts[1], "ip": parts[2], "name": parts[3]})
+            if clients:
+                return clients
+    # Fallback: ARP table
+    arp = run("arp -n 2>/dev/null | grep -v incomplete | tail -10")
+    for line in arp.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and '.' in parts[0]:
+            clients.append({"ip": parts[0], "mac": parts[2], "name": "?"})
+    return clients
 
-install -m 755 lib/gadget.sh          /usr/local/sbin/rpi-link-gadget.sh
-install -m 755 lib/gadget-teardown.sh /usr/local/sbin/rpi-link-gadget-teardown.sh
-info "Scripts → /usr/local/sbin/"
+# ── Clipboard ──────────────────────────────────────────────
 
-# =============================================================
-# STEP 4 — Networking: static IP on usb0 via NetworkManager
-# =============================================================
-step "Configuring usb0 static IP (192.168.7.2) via NetworkManager"
+def get_clipboard():
+    for tool in ["xclip -selection clipboard -o", "xsel --clipboard --output"]:
+        result = run(f"DISPLAY={DISPLAY} {tool}")
+        if result is not None:
+            return result
+    return ""
 
-# Remove any legacy /etc/network/interfaces entry — NM ignores it on Bookworm
-rm -f /etc/network/interfaces.d/usb0
-info "Removed legacy /etc/network/interfaces.d/usb0 (if present)"
+def set_clipboard(text):
+    env = f"DISPLAY={DISPLAY}"
+    for cmd in [f"echo '{text}' | DISPLAY={DISPLAY} xclip -selection clipboard",
+                f"echo '{text}' | DISPLAY={DISPLAY} xsel --clipboard --input"]:
+        try:
+            subprocess.run(cmd, shell=True, timeout=3)
+            return True
+        except:
+            continue
+    return False
 
-# Remove any existing NM profile for usb0 to avoid conflicts
-nmcli connection delete usb0-rpi-link 2>/dev/null || true
+# ── Screen recording ───────────────────────────────────────
+_recording_proc = None
+_recording_file = None
 
-# Write NM keyfile directly — more reliable than nmcli add on Bookworm
-# because nmcli may not be able to apply it while usb0 doesn't exist yet
-NM_CONN_DIR=/etc/NetworkManager/system-connections
-mkdir -p "$NM_CONN_DIR"
+def start_recording():
+    global _recording_proc, _recording_file
+    if _recording_proc and _recording_proc.poll() is None:
+        return {"ok": False, "error": "Already recording"}
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    _recording_file = str(RECORDINGS_DIR / f"recording_{ts}.mp4")
+    w, h = get_display_res()
+    cmd = [
+        "ffmpeg", "-loglevel", "quiet",
+        "-f", "x11grab", "-framerate", "15",
+        "-video_size", f"{w}x{h}",
+        "-i", f"{DISPLAY}.0+0,0",
+        "-c:v", "libx264", "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p",
+        _recording_file
+    ]
+    _recording_proc = subprocess.Popen(cmd)
+    return {"ok": True, "file": _recording_file}
 
-cat > "$NM_CONN_DIR/usb0-rpi-link.nmconnection" << 'EOF'
-[connection]
-id=usb0-rpi-link
-uuid=a1b2c3d4-e5f6-7890-abcd-ef1234567890
-type=ethernet
-interface-name=usb0
-autoconnect=true
-autoconnect-retries=0
+def stop_recording():
+    global _recording_proc, _recording_file
+    if not _recording_proc or _recording_proc.poll() is not None:
+        return {"ok": False, "error": "Not recording"}
+    _recording_proc.send_signal(signal.SIGINT)
+    _recording_proc.wait(timeout=10)
+    f = _recording_file
+    _recording_proc = None
+    _recording_file = None
+    return {"ok": True, "file": f}
 
-[ethernet]
+# ── Video streaming ────────────────────────────────────────
+_ffmpeg_proc  = None
+_latest_frame = None
+_frame_lock   = threading.Lock()
+_frame_cond   = threading.Condition(_frame_lock)
 
-[ipv4]
-method=manual
-addresses=192.168.7.2/24
+def ffmpeg_capture_loop(fps=24, width=1280, quality=4):
+    global _ffmpeg_proc, _latest_frame
+    disp_w, disp_h = get_display_res()
+    scale_h = int(disp_h * width / disp_w)
+    cmd = [
+        "ffmpeg", "-loglevel", "quiet",
+        "-f", "x11grab",
+        "-framerate", str(fps),
+        "-video_size", f"{disp_w}x{disp_h}",
+        "-i", f"{DISPLAY}.0+0,0",
+        "-vf", f"scale={width}:{scale_h}:flags=lanczos",
+        "-f", "image2pipe",
+        "-vcodec", "mjpeg",
+        "-q:v", str(quality),
+        "pipe:1"
+    ]
+    _ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    buf = b""
+    SOI = b"\xff\xd8"
+    EOI = b"\xff\xd9"
+    while True:
+        chunk = _ffmpeg_proc.stdout.read(65536)
+        if not chunk:
+            break
+        buf += chunk
+        while True:
+            start = buf.find(SOI)
+            if start == -1:
+                buf = b""
+                break
+            end = buf.find(EOI, start + 2)
+            if end == -1:
+                buf = buf[start:]
+                break
+            frame = buf[start:end + 2]
+            buf   = buf[end + 2:]
+            with _frame_cond:
+                _latest_frame = frame
+                _frame_cond.notify_all()
 
-[ipv6]
-method=disabled
-EOF
+_capture_settings = {"fps": 24, "width": 1280, "quality": 4}
 
-chmod 600 "$NM_CONN_DIR/usb0-rpi-link.nmconnection"
-info "NetworkManager keyfile written"
+def restart_capture(**kwargs):
+    global _ffmpeg_proc
+    _capture_settings.update(kwargs)
+    if _ffmpeg_proc:
+        _ffmpeg_proc.terminate()
+        _ffmpeg_proc = None
+    t = threading.Thread(target=ffmpeg_capture_loop, kwargs=_capture_settings, daemon=True)
+    t.start()
 
-# Tell NM to reload connection files
-nmcli connection reload 2>/dev/null || true
+restart_capture()
 
-# =============================================================
-# STEP 5 — dnsmasq: DHCP for the iPad
-# =============================================================
-step "Configuring dnsmasq DHCP for iPad"
+def get_frame(timeout=1.0):
+    with _frame_cond:
+        _frame_cond.wait(timeout)
+        return _latest_frame
 
-# Bookworm: NetworkManager has its own dnsmasq instance on port 53.
-# We need to stop NM from managing DNS so our dnsmasq can bind port 53.
-# The cleanest way: tell NM to use systemd-resolved instead.
-NM_CONF=/etc/NetworkManager/conf.d/rpi-link-dns.conf
-cat > "$NM_CONF" << 'EOF'
-[main]
-# RPi Link: let dnsmasq handle DNS on usb0; use systemd-resolved for main DNS
-dns=none
-EOF
-info "Told NetworkManager not to manage DNS (standalone dnsmasq will run)"
+# ── Audio streaming ────────────────────────────────────────
+_audio_clients = set()
+_audio_lock    = threading.Lock()
 
-# Now write our dnsmasq config
-cat > /etc/dnsmasq.d/rpi-link-usb0.conf << 'EOF'
-# RPi Link — DHCP only on USB gadget interface
-# This file is safe to delete if you uninstall RPi Link
+def audio_broadcast_loop():
+    cmd = [
+        "ffmpeg", "-loglevel", "quiet",
+        "-f", "pulse", "-i", "default",
+        "-ac", "2", "-ar", "44100",
+        "-f", "s16le", "pipe:1"
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if proc.poll() is not None:
+        cmd[3] = "alsa"
+        cmd[5] = AUDIO_DEV
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    CHUNK = 4096
+    while True:
+        data = proc.stdout.read(CHUNK)
+        if not data:
+            break
+        with _audio_lock:
+            dead = set()
+            for ws in list(_audio_clients):
+                try:
+                    ws.send(data)
+                except Exception:
+                    dead.add(ws)
+            _audio_clients -= dead
 
-interface=usb0
-bind-interfaces
-dhcp-range=192.168.7.10,192.168.7.20,255.255.255.0,12h
-dhcp-option=option:router,192.168.7.2
-dhcp-option=option:dns-server,192.168.7.2
+threading.Thread(target=audio_broadcast_loop, daemon=True).start()
 
-# Don't read /etc/hosts or /etc/resolv.conf
-no-hosts
-no-resolv
-EOF
+# ── Input injection ────────────────────────────────────────
 
-# Prevent dnsmasq from failing to start if usb0 isn't up yet
-# by wrapping it as a delayed start in the service (handled below)
-systemctl enable dnsmasq
-info "dnsmasq configured"
+def inject_mouse(action, x, y, button=1, dy=0, stream_w=1280):
+    disp_w, disp_h = get_display_res()
+    stream_h = int(disp_h * stream_w / disp_w)
+    rx = max(0, min(int(x * disp_w / stream_w), disp_w - 1))
+    ry = max(0, min(int(y * disp_h / stream_h), disp_h - 1))
+    env = {"DISPLAY": DISPLAY}
+    base = ["xdotool"]
+    if action == "move":
+        subprocess.Popen(base + ["mousemove", str(rx), str(ry)], env=env, stderr=subprocess.DEVNULL)
+    elif action == "down":
+        subprocess.Popen(base + ["mousemove", str(rx), str(ry), "mousedown", str(button)], env=env, stderr=subprocess.DEVNULL)
+    elif action == "up":
+        subprocess.Popen(base + ["mousemove", str(rx), str(ry), "mouseup", str(button)], env=env, stderr=subprocess.DEVNULL)
+    elif action == "click":
+        subprocess.Popen(base + ["mousemove", str(rx), str(ry), "click", str(button)], env=env, stderr=subprocess.DEVNULL)
+    elif action == "dblclick":
+        subprocess.Popen(base + ["mousemove", str(rx), str(ry), "click", "--repeat", "2", "--delay", "50", str(button)], env=env, stderr=subprocess.DEVNULL)
+    elif action == "scroll":
+        btn = "4" if dy < 0 else "5"
+        subprocess.Popen(base + ["mousemove", str(rx), str(ry), "click", "--repeat", "3", btn], env=env, stderr=subprocess.DEVNULL)
+    elif action == "rclick":
+        subprocess.Popen(base + ["mousemove", str(rx), str(ry), "click", "3"], env=env, stderr=subprocess.DEVNULL)
 
-# =============================================================
-# STEP 6 — Avahi mDNS
-# =============================================================
-step "Enabling Avahi mDNS"
-systemctl enable avahi-daemon
-info "avahi-daemon enabled (raspberrypi.local)"
+def inject_key(key):
+    subprocess.Popen(["xdotool", "key", "--", key], env={"DISPLAY": DISPLAY}, stderr=subprocess.DEVNULL)
 
-# =============================================================
-# STEP 7 — Install app files
-# =============================================================
-step "Installing app to /opt/rpi-link"
+def inject_type(text):
+    subprocess.Popen(["xdotool", "type", "--clearmodifiers", "--", text],
+                     env={"DISPLAY": DISPLAY}, stderr=subprocess.DEVNULL)
 
-mkdir -p /opt/rpi-link/static
-cp server.py            /opt/rpi-link/server.py
-cp static/index.html    /opt/rpi-link/static/index.html
-info "App files installed"
+# ── Routes: Video ──────────────────────────────────────────
 
-# =============================================================
-# STEP 8 — Xvfb virtual display (for headless Pi)
-# =============================================================
-step "Virtual framebuffer service (headless fallback)"
+@app.route("/")
+def index():
+    return send_from_directory("static", "index.html")
 
-cat > /etc/systemd/system/rpi-link-xvfb.service << 'EOF'
-[Unit]
-Description=RPi Link — Virtual Framebuffer (headless fallback)
-After=local-fs.target
+@app.route("/api/stream")
+def stream():
+    fps_limit = float(request.args.get("fps", 24))
+    interval  = 1.0 / fps_limit
 
-[Service]
-Type=simple
-ExecStart=/usr/bin/Xvfb :99 -screen 0 1920x1080x24 -ac
-Restart=on-failure
-RestartSec=3
+    def generate():
+        last = 0
+        while True:
+            frame = get_frame(timeout=2.0)
+            if not frame:
+                continue
+            now = time.time()
+            if now - last < interval:
+                continue
+            last = now
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+            )
 
-[Install]
-WantedBy=multi-user.target
-EOF
+    return Response(stream_with_context(generate()),
+                    mimetype="multipart/x-mixed-replace; boundary=frame",
+                    headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
-systemctl daemon-reload
-systemctl enable rpi-link-xvfb
-info "rpi-link-xvfb service installed"
+@app.route("/api/screenshot")
+def screenshot():
+    frame = _latest_frame
+    if not frame:
+        return Response("no frame", status=503)
+    return Response(frame, mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
 
-# =============================================================
-# STEP 9 — USB Gadget service
-# =============================================================
-step "USB Gadget service (runs at sysinit, before networking)"
+@app.route("/api/stream/settings", methods=["POST"])
+def stream_settings():
+    body  = request.get_json(silent=True) or {}
+    fps   = int(body.get("fps",  24))
+    qual  = int(body.get("quality", 4))
+    w     = int(body.get("width", 1280))
+    restart_capture(fps=fps, quality=qual, width=w)
+    return jsonify({"ok": True})
 
-cat > /etc/systemd/system/rpi-link-gadget.service << 'EOF'
-[Unit]
-Description=RPi Link — USB Gadget (libcomposite / ConfigFS)
-# Run as early as possible — before NM brings up interfaces
-After=local-fs.target
-Before=network-pre.target
-DefaultDependencies=no
+# ── Routes: Audio ──────────────────────────────────────────
 
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/sbin/rpi-link-gadget.sh
-ExecStop=/usr/local/sbin/rpi-link-gadget-teardown.sh
-StandardOutput=journal
-StandardError=journal
+@sock.route("/ws/audio")
+def audio_ws(ws):
+    with _audio_lock:
+        _audio_clients.add(ws)
+    try:
+        while True:
+            ws.receive(timeout=60)
+    except Exception:
+        pass
+    finally:
+        with _audio_lock:
+            _audio_clients.discard(ws)
 
-[Install]
-WantedBy=sysinit.target
-EOF
+# ── Routes: Input ──────────────────────────────────────────
 
-systemctl daemon-reload
-systemctl enable rpi-link-gadget
-info "rpi-link-gadget service installed"
+@app.route("/api/input/mouse", methods=["POST"])
+def input_mouse():
+    body   = request.get_json(silent=True) or {}
+    action = body.get("action", "move")
+    x      = float(body.get("x", 0))
+    y      = float(body.get("y", 0))
+    btn    = int(body.get("button", 1))
+    dy     = float(body.get("dy", 0))
+    sw     = int(body.get("streamW", 1280))
+    inject_mouse(action, x, y, btn, dy, sw)
+    return jsonify({"ok": True})
 
-# =============================================================
-# STEP 10 — Dashboard service
-# =============================================================
-step "Dashboard service"
+@app.route("/api/input/key", methods=["POST"])
+def input_key():
+    body = request.get_json(silent=True) or {}
+    key  = body.get("key", "")
+    if key:
+        inject_key(key)
+    return jsonify({"ok": True})
 
-cat > /etc/systemd/system/rpi-link.service << 'EOF'
-[Unit]
-Description=RPi Link — iPad Dashboard Server
-# Wait for gadget + network + dnsmasq
-After=rpi-link-gadget.service network.target dnsmasq.service rpi-link-xvfb.service
+@app.route("/api/input/type", methods=["POST"])
+def input_type():
+    body = request.get_json(silent=True) or {}
+    text = body.get("text", "")
+    if text:
+        inject_type(text)
+    return jsonify({"ok": True})
 
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/opt/rpi-link
-ExecStart=/usr/bin/python3 /opt/rpi-link/server.py
-Restart=always
-RestartSec=5
-# Use real display if available, fall back to Xvfb
-Environment=DISPLAY=:0
-ExecStartPre=/bin/bash -c 'DISPLAY=:0 xdpyinfo >/dev/null 2>&1 || export DISPLAY=:99; true'
+# ── Routes: Clipboard ──────────────────────────────────────
 
-[Install]
-WantedBy=multi-user.target
-EOF
+@app.route("/api/clipboard", methods=["GET"])
+def clipboard_get():
+    return jsonify({"text": get_clipboard()})
 
-systemctl daemon-reload
-systemctl enable rpi-link
-info "rpi-link service installed"
+@app.route("/api/clipboard", methods=["POST"])
+def clipboard_set():
+    body = request.get_json(silent=True) or {}
+    text = body.get("text", "")
+    ok   = set_clipboard(text)
+    return jsonify({"ok": ok})
 
-# =============================================================
-# DONE
-# =============================================================
-echo ""
-echo -e "${GRN}${BLD}╔══════════════════════════════════════════════════╗${NC}"
-echo -e "${GRN}${BLD}║  ✓  RPi Link v3 setup complete!                  ║${NC}"
-echo -e "${GRN}${BLD}║                                                  ║${NC}"
-echo -e "${GRN}${BLD}║  Next steps:                                     ║${NC}"
-echo -e "${GRN}${BLD}║    1.  sudo reboot                               ║${NC}"
-echo -e "${GRN}${BLD}║    2.  Plug USB-C cable → iPad                   ║${NC}"
-echo -e "${GRN}${BLD}║    3.  Safari → http://raspberrypi.local         ║${NC}"
-echo -e "${GRN}${BLD}║        Fallback: http://192.168.7.2              ║${NC}"
-echo -e "${GRN}${BLD}╚══════════════════════════════════════════════════╝${NC}"
-echo ""
+# ── Routes: Files ──────────────────────────────────────────
 
-if $IS_PI5; then
-    echo -e "${YLW}Pi 5 reminder:${NC}"
-    echo -e "  • Make sure firmware is current: ${CYN}sudo rpi-eeprom-update${NC}"
-    echo -e "  • Use the USB-C port (not USB-A ports) for gadget mode"
-    echo -e "  • A data-capable USB-C cable is required — charge-only cables won't work"
-    echo ""
-fi
+ALLOWED_BROWSE_ROOTS = [
+    Path.home(),
+    Path("/tmp"),
+    Path("/media"),
+    Path("/mnt"),
+    RECORDINGS_DIR,
+]
 
-echo -e "After reboot, verify with:"
-echo -e "  ${CYN}cat /sys/kernel/config/usb_gadget/rpi-link/UDC${NC}  # should not be empty"
-echo -e "  ${CYN}ip addr show usb0${NC}                                # should show 192.168.7.2"
-echo -e "  ${CYN}sudo journalctl -u rpi-link-gadget -b${NC}            # gadget boot log"
+def safe_path(raw):
+    p = Path(raw).resolve()
+    for root in ALLOWED_BROWSE_ROOTS:
+        try:
+            p.relative_to(root.resolve())
+            return p
+        except ValueError:
+            continue
+    return None
+
+@app.route("/api/files/list")
+def files_list():
+    raw  = request.args.get("path", str(Path.home()))
+    path = safe_path(raw)
+    if not path or not path.exists():
+        return jsonify({"error": "Invalid path"}), 400
+    entries = []
+    try:
+        for item in sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name.lower())):
+            stat = item.stat()
+            entries.append({
+                "name":     item.name,
+                "path":     str(item),
+                "is_dir":   item.is_dir(),
+                "size":     stat.st_size if item.is_file() else 0,
+                "modified": int(stat.st_mtime),
+                "mime":     mimetypes.guess_type(item.name)[0] or "",
+            })
+    except PermissionError:
+        return jsonify({"error": "Permission denied"}), 403
+    return jsonify({"path": str(path), "parent": str(path.parent), "entries": entries})
+
+@app.route("/api/files/download")
+def files_download():
+    raw  = request.args.get("path", "")
+    path = safe_path(raw)
+    if not path or not path.is_file():
+        return jsonify({"error": "Not a file"}), 404
+    return send_from_directory(str(path.parent), path.name, as_attachment=True)
+
+@app.route("/api/files/upload", methods=["POST"])
+def files_upload():
+    dest_raw = request.args.get("dest", str(Path.home()))
+    dest     = safe_path(dest_raw)
+    if not dest or not dest.is_dir():
+        return jsonify({"error": "Invalid destination"}), 400
+    saved = []
+    for f in request.files.values():
+        name = Path(f.filename).name
+        out  = dest / name
+        f.save(str(out))
+        saved.append(name)
+    return jsonify({"ok": True, "saved": saved})
+
+@app.route("/api/files/mkdir", methods=["POST"])
+def files_mkdir():
+    body = request.get_json(silent=True) or {}
+    dest = safe_path(body.get("path", ""))
+    if not dest:
+        return jsonify({"error": "Invalid path"}), 400
+    dest.mkdir(parents=True, exist_ok=True)
+    return jsonify({"ok": True})
+
+@app.route("/api/files/delete", methods=["POST"])
+def files_delete():
+    body = request.get_json(silent=True) or {}
+    path = safe_path(body.get("path", ""))
+    if not path or not path.exists():
+        return jsonify({"error": "Not found"}), 404
+    if path.is_dir():
+        shutil.rmtree(str(path))
+    else:
+        path.unlink()
+    return jsonify({"ok": True})
+
+@app.route("/api/files/rename", methods=["POST"])
+def files_rename():
+    body     = request.get_json(silent=True) or {}
+    src      = safe_path(body.get("src", ""))
+    new_name = Path(body.get("name", "")).name
+    if not src or not src.exists() or not new_name:
+        return jsonify({"error": "Invalid"}), 400
+    dst = src.parent / new_name
+    src.rename(dst)
+    return jsonify({"ok": True})
+
+# ── Routes: Recording ──────────────────────────────────────
+
+@app.route("/api/record/start", methods=["POST"])
+def record_start():
+    return jsonify(start_recording())
+
+@app.route("/api/record/stop", methods=["POST"])
+def record_stop():
+    return jsonify(stop_recording())
+
+@app.route("/api/record/status")
+def record_status():
+    recording = _recording_proc is not None and _recording_proc.poll() is None
+    return jsonify({"recording": recording, "file": _recording_file})
+
+# ── Routes: System ─────────────────────────────────────────
+
+@app.route("/api/stats")
+def stats():
+    mem  = mem_info()
+    disk = disk_info()
+    iface = CONFIG.get("hotspot_iface", "wlan1")
+    hotspot_ip = run(f"ip addr show {iface} 2>/dev/null | grep 'inet ' | awk '{{print $2}}'") or "not up"
+    return jsonify({
+        "hostname":  run("hostname"),
+        "model":     pi_model(),
+        "uptime":    run("uptime -p").replace("up ", ""),
+        "cpu":       cpu_percent(),
+        "temp":      cpu_temp(),
+        "mem":       mem,
+        "disk":      disk,
+        "hotspot_ip": hotspot_ip,
+        "hotspot_iface": iface,
+        "net":       net_stats(),
+        "processes": processes(),
+        "clients":   hotspot_clients(),
+        "time":      time.strftime("%H:%M:%S"),
+        "date":      time.strftime("%A %d %B %Y"),
+        "display":   "%dx%d" % get_display_res(),
+        "stream":    _capture_settings,
+        "recording": _recording_proc is not None and _recording_proc.poll() is None,
+    })
+
+@app.route("/api/process/kill", methods=["POST"])
+def process_kill():
+    body = request.get_json(silent=True) or {}
+    pid  = int(body.get("pid", 0))
+    sig  = body.get("signal", "TERM")
+    if not pid:
+        return jsonify({"error": "No PID"}), 400
+    try:
+        os.kill(pid, signal.SIGTERM if sig == "TERM" else signal.SIGKILL)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/system/reboot", methods=["POST"])
+def system_reboot():
+    threading.Timer(2.0, lambda: subprocess.run(["reboot"])).start()
+    return jsonify({"ok": True, "message": "Rebooting in 2s…"})
+
+@app.route("/api/system/shutdown", methods=["POST"])
+def system_shutdown():
+    threading.Timer(2.0, lambda: subprocess.run(["shutdown", "-h", "now"])).start()
+    return jsonify({"ok": True, "message": "Shutting down in 2s…"})
+
+@app.route("/api/system/sleep", methods=["POST"])
+def system_sleep():
+    subprocess.Popen(["systemctl", "suspend"])
+    return jsonify({"ok": True})
+
+BLOCKED = ["rm -rf /", "mkfs", "dd if=", "fork bomb", ":(){ :|:& };:"]
+
+@app.route("/api/run", methods=["POST"])
+def run_cmd():
+    body = request.get_json(silent=True) or {}
+    cmd  = body.get("cmd", "").strip()
+    if any(b in cmd for b in BLOCKED):
+        return jsonify({"error": "Command blocked"}), 403
+    if not cmd:
+        return jsonify({"output": ""})
+    out = run(cmd, timeout=15)
+    return jsonify({"output": out or "(no output)"})
+
+# ── Routes: Hotspot info ───────────────────────────────────
+
+@app.route("/api/hotspot")
+def hotspot_info():
+    return jsonify({
+        "ssid":    CONFIG.get("hotspot_ssid", "RPiLink"),
+        "iface":   CONFIG.get("hotspot_iface", "wlan1"),
+        "ip":      CONFIG.get("hotspot_ip", "10.42.0.1"),
+        "clients": hotspot_clients(),
+        "hostapd_running": run("systemctl is-active hostapd") == "active",
+    })
+
+# ── Main ───────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    port = CONFIG.get("server_port", 80)
+    print(f"RPi Link v4 → http://0.0.0.0:{port}")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
