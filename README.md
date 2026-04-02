@@ -1,5 +1,5 @@
-# rpi-ipad-usb
-RPI iPad USB [AI-GEN TEST]
+# Hotspoti
+Raspberry Pi Screen Sharing Hotspot, perfect for accesing your raspberry pi whilst travelling.
 
 > [!CAUTION]
 > This version is in very early alpha stages and may not work
