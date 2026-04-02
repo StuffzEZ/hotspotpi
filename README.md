@@ -1,6 +1,12 @@
 # rpi-ipad-usb
 RPI iPad USB [AI-GEN TEST]
 
+> [!CAUTION]
+> This version is in very early alpha stages and may not work
+
+> [!NOTE]
+> Some parts of this README talks about USB cables and v3. That is the old version (on the v3 branch)
+
 > [!NOTE]
 > This code is COMPLETELY AI-Generated and is mainly for a proof of concept/testing purposes only.
 
